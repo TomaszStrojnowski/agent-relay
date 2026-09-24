@@ -1,9 +1,10 @@
-"""Protocol tests for the SQLite starter.
+"""Protocol tests, run against whatever RELAY_DATABASE_URL points at.
 
 These tests intentionally exercise storage calls from multiple threads: that
 is the closest local equivalent to several worker processes racing to claim an
-inbox.  The production guarantee comes from SQLite's BEGIN IMMEDIATE boundary,
-not from a Python lock.
+inbox.  The production guarantee comes from the database, not from a Python
+lock -- BEGIN IMMEDIATE on SQLite, FOR UPDATE SKIP LOCKED on PostgreSQL.  The
+race test below must therefore be run on both.
 """
 
 from __future__ import annotations
@@ -98,7 +99,7 @@ def test_protocol_idempotency_terminal_retry_and_auth_boundary():
         assert "claim_token" not in attempts["items"][0]
 
 
-def test_sqlite_atomic_claims_distribute_without_overlap():
+def test_atomic_claims_distribute_without_overlap():
     with TestClient(main.app) as client:
         _sender, sender_headers = register(client, "sender")
         recipient, _recipient_headers = register(client, "recipient")

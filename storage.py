@@ -31,6 +31,7 @@ from database import (
     db_time,
     immediate_transaction,
     iso_time,
+    lock_rows_for_claim,
     recover_expired,
     recover_expired_in_session,
     utcnow,
@@ -144,11 +145,16 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
     with immediate_transaction() as db:
         now = utcnow()
         recover_expired_in_session(db, now)
+        # The oldest queued task this agent can still take.  On PostgreSQL the
+        # row is locked here and skipped by any other worker, which is what
+        # replaces SQLite's single-writer transaction.
         task = db.scalar(
-            select(Task)
-            .where(Task.recipient_id == agent_id, Task.status == "queued")
-            .order_by(Task.created_at, Task.id)
-            .limit(1)
+            lock_rows_for_claim(
+                select(Task)
+                .where(Task.recipient_id == agent_id, Task.status == "queued")
+                .order_by(Task.created_at, Task.id)
+                .limit(1)
+            )
         )
         if task is None:
             return None

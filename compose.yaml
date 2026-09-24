@@ -1,0 +1,45 @@
+# The database service is named `postgres`, so `postgres` is also its hostname
+# on the Compose network. That name is what the API connects to; `localhost`
+# inside the api container would be the api container itself.
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # Only so the test suite can run from the host against this PostgreSQL.
+      # The api does not use it; it reaches `postgres:5432` over the Compose
+      # network. 55432 avoids clashing with a local PostgreSQL on 5432.
+      - "55432:5432"
+    healthcheck:
+      # Without this the api starts before Postgres accepts connections and
+      # crashes on the first query.
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    environment:
+      # psycopg 3 is the driver in pyproject.toml, hence the +psycopg suffix.
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@postgres:5432/relay
+    ports:
+      - "8100:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # /ready queries the real tables, so this stays red until the schema
+      # exists -- unlike /health, which only proves the process is alive.
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/ready || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:

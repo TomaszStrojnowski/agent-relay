@@ -1,0 +1,17 @@
+.git
+.github
+.venv
+.ruff_cache/
+.pytest_cache/
+__pycache__/
+*.db
+*.db-shm
+*.db-wal
+*-credentials.json
+*.log
+k8s/
+docs/
+Dockerfile
+.dockerignore
+compose.yaml
+README.md

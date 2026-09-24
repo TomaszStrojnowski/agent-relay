@@ -97,6 +97,54 @@ recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
 the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
 running tests against another database.
 
-This starter intentionally does not include Docker, Kubernetes, CI, external
-brokers, an LLM, or a PostgreSQL implementation. Those are deployment and
-student-port concerns rather than part of the local relay protocol.
+## Run it in a container
+
+```bash
+docker build -t agent-relay:local .
+docker run -d --name agent-relay -p 8001:8000 -v agent-relay-data:/data agent-relay:local
+```
+
+The dashboard is then at <http://127.0.0.1:8001/>. The image runs uvicorn with
+`--host 0.0.0.0`; its default of `127.0.0.1` is unreachable from outside the
+container and makes `-p` look broken. The SQLite file lives in the `/data`
+volume so it survives `docker rm`.
+
+## Run it with PostgreSQL
+
+```bash
+docker compose up --build
+```
+
+`compose.yaml` starts PostgreSQL and the API together. The API reaches the
+database at the hostname `postgres` — the service name is the hostname on the
+Compose network. The API waits for `pg_isready` before starting. The dashboard
+is at <http://127.0.0.1:8100/>.
+
+PostgreSQL is also published on host port `55432`, only so the test suite can
+run against it from outside Compose:
+
+```bash
+docker compose exec postgres psql -U relay -d relay -c "CREATE DATABASE relay_test;"
+RELAY_DATABASE_URL="postgresql+psycopg://relay:relay@localhost:55432/relay_test" uv run pytest -q
+```
+
+The race test must pass on both databases; see
+[docs/adr/0001](docs/adr/0001-postgres-row-locking-instead-of-a-single-writer.md)
+for why the two use different locking.
+
+## Integration test
+
+`test_integration_task_flow.py` runs the first acceptance scenario from
+`SPEC.md`: two agents register, one sends a task, the other claims it and
+returns a result. Set `RELAY_BASE_URL` to point it at a running deployment
+instead of an in-process app:
+
+```bash
+RELAY_BASE_URL=http://127.0.0.1:8100 uv run pytest test_integration_task_flow.py -q
+```
+
+## Still not included
+
+Kubernetes manifests and CI. Those remain deployment exercises rather than part
+of the local relay protocol. The starter also has no external broker and no LLM,
+by design.

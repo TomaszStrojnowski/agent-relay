@@ -1,9 +1,21 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models, for SQLite and PostgreSQL.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module is the only place that knows which database is in use.  The rest
+of the application talks to the models through :mod:`storage` and never
+branches on dialect.
+
+Two write strategies live behind one seam:
+
+SQLite
+    ``BEGIN IMMEDIATE`` reserves the single writer for the whole transaction.
+    SQLite has no row locks, so every writer serializes.
+
+PostgreSQL
+    An ordinary transaction plus ``SELECT ... FOR UPDATE SKIP LOCKED`` on the
+    rows being claimed.  Concurrent workers skip each other's locked rows
+    instead of queueing, which is the point of moving to PostgreSQL at all.
+
+Both give the same guarantee the protocol requires: one active lease per task.
 """
 
 from __future__ import annotations
@@ -134,6 +146,25 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+IS_SQLITE = _is_sqlite(DATABASE_URL)
+
+
+def lock_rows_for_claim(statement: Any) -> Any:
+    """Add row locking to a SELECT that is about to claim the rows it returns.
+
+    On PostgreSQL this is ``FOR UPDATE SKIP LOCKED``: a row another worker has
+    already locked is skipped, not waited for, so two workers never receive the
+    same task and neither blocks.
+
+    On SQLite this is a no-op, because ``immediate_transaction`` has already
+    excluded every other writer.
+    """
+
+    if IS_SQLITE:
+        return statement
+    return statement.with_for_update(skip_locked=True)
+
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
 if _is_sqlite(DATABASE_URL):
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
@@ -177,19 +208,22 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Open the write transaction used before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    On SQLite this is a ``BEGIN IMMEDIATE`` writer reservation: it serializes
+    claims, recovery and terminal submissions across API processes, because
+    SQLite offers no row locks.
+
+    On PostgreSQL this is an ordinary transaction.  Exclusion happens per row
+    instead, through :func:`lock_rows_for_claim`, so unrelated writes proceed
+    in parallel.  Either way each task ends up with one active lease.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if IS_SQLITE:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
         connection.commit()
@@ -205,11 +239,16 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
+    # Recovery runs inside every claim, so on PostgreSQL two workers can reach
+    # it at once.  Locking the expired attempts here means each one is expired
+    # by exactly one worker; the other skips it and moves on.
     expired = list(
         db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
+            lock_rows_for_claim(
+                select(Attempt)
+                .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+                .order_by(Attempt.lease_expires_at, Attempt.id)
+            )
         )
     )
     count = 0
@@ -245,6 +284,7 @@ __all__ = [
     "Base",
     "DATABASE_URL",
     "DEFAULT_PAGE_SIZE",
+    "IS_SQLITE",
     "LEASE_SECONDS",
     "MAX_ATTEMPTS",
     "MAX_BODY_BYTES",
@@ -258,6 +298,7 @@ __all__ = [
     "immediate_transaction",
     "init_db",
     "iso_time",
+    "lock_rows_for_claim",
     "recover_expired",
     "recover_expired_in_session",
     "utcnow",
