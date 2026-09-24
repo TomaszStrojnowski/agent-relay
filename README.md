@@ -143,8 +143,45 @@ instead of an in-process app:
 RELAY_BASE_URL=http://127.0.0.1:8100 uv run pytest test_integration_task_flow.py -q
 ```
 
-## Still not included
+## Run it on Kubernetes (kind)
 
-Kubernetes manifests and CI. Those remain deployment exercises rather than part
-of the local relay protocol. The starter also has no external broker and no LLM,
-by design.
+```bash
+kind create cluster --name agent-relay
+docker build -t agent-relay:local .
+kind load docker-image agent-relay:local --name agent-relay
+kubectl apply -f k8s/
+kubectl rollout status deployment/agent-relay
+kubectl port-forward service/agent-relay 8200:8000
+```
+
+The dashboard is then at <http://127.0.0.1:8200/>. `k8s/` holds PostgreSQL
+(Secret, PersistentVolumeClaim, Deployment, Service) and the API (Deployment,
+Service). The API has a `wait-for-postgres` init container, because Kubernetes
+has no `depends_on`: without it the API starts first and crash-loops. The image
+uses `imagePullPolicy: Never`, since it exists only inside the kind node.
+
+## CI/CD with act
+
+`.github/workflows/ci.yml` has two jobs. `test` runs the protocol tests and the
+integration test against a PostgreSQL service. `deploy` runs only if `test`
+passed: it builds the image with a unique tag (commit + timestamp), loads it
+into kind, rolls it out and checks the dashboard. A failing test leaves the
+running version untouched.
+
+`deploy` targets the local kind cluster, so it only runs under act; on GitHub it
+is skipped. To run the whole pipeline locally:
+
+```bash
+# once: give act the cluster's internal kubeconfig (file is git-ignored)
+echo "KIND_KUBECONFIG_B64=$(kind get kubeconfig --internal --name agent-relay | base64 -w0)" > .secrets
+
+act push -P ubuntu-latest=catthehacker/ubuntu:act-latest --secret-file .secrets --network kind
+```
+
+`--network kind` is required: the internal kubeconfig addresses the control
+plane as `agent-relay-control-plane`, a name that only resolves on kind's Docker
+network.
+
+## Not included
+
+An external broker and an LLM, by design.

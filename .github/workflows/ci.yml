@@ -1,0 +1,91 @@
+# Test, then build and deploy to the local kind cluster -- deploy runs only if
+# every test passed. Run locally with act; see docs/ci.md.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # A container job, so the database is reached as `postgres` both on
+    # GitHub and under act. On a bare runner it would be localhost on GitHub
+    # and `postgres` under act.
+    container: python:3.11-slim
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay_test
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay_test"
+          --health-interval 3s
+          --health-timeout 3s
+          --health-retries 20
+    env:
+      RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@postgres:5432/relay_test
+    steps:
+      - uses: actions/checkout@v4
+      - run: pip install --quiet uv==0.12.4
+      - run: uv sync --frozen
+      # The starter's protocol tests, including the claim race, on PostgreSQL.
+      - run: uv run --frozen pytest -q test_agent_relay.py
+      # The integration test from Question 2, same database.
+      - run: uv run --frozen pytest -q test_integration_task_flow.py
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    # The target is a kind cluster on the developer's machine, which only
+    # exists under act. On GitHub this job is skipped; act's default actor is
+    # `nektos/act`.
+    if: github.actor == 'nektos/act'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pick a unique image tag
+        # Commit plus time: rerunning the same commit still gets a new tag, so
+        # the Deployment always sees a changed image and rolls out.
+        run: echo "TAG=$(git rev-parse --short HEAD)-$(date +%s)" >> "$GITHUB_ENV"
+
+      - name: Build image
+        run: docker build -t "agent-relay:$TAG" .
+
+      - name: Install kind and kubectl
+        run: |
+          curl -fsSLo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          curl -fsSLo /usr/local/bin/kubectl "https://dl.k8s.io/release/v1.34.1/bin/linux/amd64/kubectl"
+          chmod +x /usr/local/bin/kind /usr/local/bin/kubectl
+
+      - name: Reach the kind cluster
+        env:
+          KIND_KUBECONFIG_B64: ${{ secrets.KIND_KUBECONFIG_B64 }}
+        run: |
+          # The kubeconfig is kind's *internal* one, addressing the control
+          # plane by container name. That name only resolves on the `kind`
+          # Docker network, so act must be started with `--network kind`.
+          mkdir -p ~/.kube
+          echo "$KIND_KUBECONFIG_B64" | base64 -d > ~/.kube/config
+          kubectl get nodes
+
+      - name: Load image into kind
+        run: kind load docker-image "agent-relay:$TAG" --name agent-relay
+
+      - name: Deploy
+        run: |
+          kubectl apply -f k8s/postgres.yaml
+          # Swap the tag in before applying, so there is one rollout, straight
+          # to the new image.
+          sed "s|image: agent-relay:local|image: agent-relay:$TAG|" k8s/api.yaml | kubectl apply -f -
+          kubectl rollout status deployment/agent-relay --timeout=180s
+
+      - name: Smoke test
+        run: |
+          kubectl port-forward service/agent-relay 18000:8000 &
+          for i in $(seq 1 30); do curl -fsS http://127.0.0.1:18000/ready && break; sleep 1; done
+          curl -fsS http://127.0.0.1:18000/ | grep -o "<h1>[^<]*</h1>"
